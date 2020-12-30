@@ -6,6 +6,7 @@
  * 	Supports 1, 3 or 4 component input. (luminance, RGB or RGBX)
  *
  * Latest revisions:
+ *	*.**              Added jo_write_jpg_to_func that takes a write callback
  *	1.60 (2019-27-11) Added support for subsampling U,V so that it encodes smaller files. Enabled when quality <= 90.
  *	1.52 (2012-22-11) Added support for specifying Luminance, RGB, or RGBA via comp(onents) argument (1, 3 and 4 respectively). 
  *	1.51 (2012-19-11) Fixed some warnings
@@ -17,7 +18,7 @@
  * Basic usage:
  *	char *foo = new char[128*128*4]; // 4 component. RGBX format, where X is unused 
  *	jo_write_jpg("foo.jpg", foo, 128, 128, 4, 90); // comp can be 1, 3, or 4. Lum, RGB, or RGBX respectively.
- * 	
+ *
  * */
 
 #ifndef JO_INCLUDE_JPEG_H
