@@ -1,4 +1,4 @@
-/* public domain Simple, Minimalistic JPEG writer - http://jonolick.com
+/* Public Domain, Simple, Minimalistic JPEG writer - http://jonolick.com
  *
  * Quick Notes:
  * 	Based on a javascript jpeg writer
@@ -6,6 +6,7 @@
  * 	Supports 1, 3 or 4 component input. (luminance, RGB or RGBX)
  *
  * Latest revisions:
+ *  1.60 (2019-27-11) Added support for subsampling U,V so that it encodes smaller files. Enabled when quality <= 90.
  *	1.52 (2012-22-11) Added support for specifying Luminance, RGB, or RGBA via comp(onents) argument (1, 3 and 4 respectively). 
  *	1.51 (2012-19-11) Fixed some warnings
  *	1.50 (2012-18-11) MT safe. Simplified. Optimized. Reduced memory requirements. Zero allocations. No namespace polution. Approx 340 lines code.
@@ -110,23 +111,26 @@ static void jo_calcBits(int val, unsigned short bits[2]) {
 	bits[0] = val & ((1<<bits[1])-1);
 }
 
-static int jo_processDU(FILE *fp, int &bitBuf, int &bitCnt, float *CDU, float *fdtbl, int DC, const unsigned short HTDC[256][2], const unsigned short HTAC[256][2]) {
+static int jo_processDU(FILE *fp, int &bitBuf, int &bitCnt, float *CDU, int du_stride, float *fdtbl, int DC, const unsigned short HTDC[256][2], const unsigned short HTAC[256][2]) {
 	const unsigned short EOB[2] = { HTAC[0x00][0], HTAC[0x00][1] };
 	const unsigned short M16zeroes[2] = { HTAC[0xF0][0], HTAC[0xF0][1] };
 
 	// DCT rows
-	for(int dataOff=0; dataOff<64; dataOff+=8) {
-		jo_DCT(CDU[dataOff], CDU[dataOff+1], CDU[dataOff+2], CDU[dataOff+3], CDU[dataOff+4], CDU[dataOff+5], CDU[dataOff+6], CDU[dataOff+7]);
+	for(int i=0; i<du_stride*8; i+=du_stride) {
+		jo_DCT(CDU[i], CDU[i+1], CDU[i+2], CDU[i+3], CDU[i+4], CDU[i+5], CDU[i+6], CDU[i+7]);
 	}
 	// DCT columns
-	for(int dataOff=0; dataOff<8; ++dataOff) {
-		jo_DCT(CDU[dataOff], CDU[dataOff+8], CDU[dataOff+16], CDU[dataOff+24], CDU[dataOff+32], CDU[dataOff+40], CDU[dataOff+48], CDU[dataOff+56]);
+	for(int i=0; i<8; ++i) {
+		jo_DCT(CDU[i], CDU[i+du_stride], CDU[i+du_stride*2], CDU[i+du_stride*3], CDU[i+du_stride*4], CDU[i+du_stride*5], CDU[i+du_stride*6], CDU[i+du_stride*7]);
 	}
 	// Quantize/descale/zigzag the coefficients
 	int DU[64];
-	for(int i=0; i<64; ++i) {
-		float v = CDU[i]*fdtbl[i];
-		DU[s_jo_ZigZag[i]] = (int)(v < 0 ? ceilf(v - 0.5f) : floorf(v + 0.5f));
+	for(int y = 0, j=0; y < 8; ++y) {
+		for(int x = 0; x < 8; ++x,++j) {
+			int i = y*du_stride+x;
+			float v = CDU[i]*fdtbl[j];
+			DU[s_jo_ZigZag[j]] = (int)(v < 0 ? ceilf(v - 0.5f) : floorf(v + 0.5f));
+		}
 	}
 
 	// Encode DC
@@ -249,6 +253,7 @@ bool jo_write_jpg(const char *filename, const void *data, int width, int height,
 	}
 
 	quality = quality ? quality : 90;
+	int subsample = quality <= 90 ? 1 : 0;
 	quality = quality < 1 ? 1 : quality > 100 ? 100 : quality;
 	quality = quality < 50 ? 5000 / quality : 200 - quality * 2;
 
@@ -269,12 +274,12 @@ bool jo_write_jpg(const char *filename, const void *data, int width, int height,
 	}
 
 	// Write Headers
-	static const unsigned char head0[] = { 0xFF,0xD8,0xFF,0xE0,0,0x10,'J','F','I','F',0,1,1,0,0,1,0,1,0,0,0xFF,0xDB,0,0x84,0 };
+	static const unsigned char head0[] = { 0xFF,0xD8,  0xFF,0xE0,0,0x10,'J','F','I','F',0,1,1,0,0,1,0,1,0,0,0xFF,  0xDB,0,0x84,0 };
 	fwrite(head0, sizeof(head0), 1, fp);
 	fwrite(YTable, sizeof(YTable), 1, fp);
 	putc(1, fp);
 	fwrite(UVTable, sizeof(UVTable), 1, fp);
-	const unsigned char head1[] = { 0xFF,0xC0,0,0x11,8,height>>8,height&0xFF,width>>8,width&0xFF,3,1,0x11,0,2,0x11,1,3,0x11,1,0xFF,0xC4,0x01,0xA2,0 };
+	const unsigned char head1[] = { 0xFF,0xC0,0,0x11,8,(unsigned char)(height>>8),(unsigned char)(height&0xFF),(unsigned char)(width>>8),(unsigned char)(width&0xFF),3,1,(unsigned char)(subsample?0x22:0x11),0,2,0x11,1,3,0x11,1,0xFF,0xC4,0x01,0xA2,0 };
 	fwrite(head1, sizeof(head1), 1, fp);
 	fwrite(std_dc_luminance_nrcodes+1, sizeof(std_dc_luminance_nrcodes)-1, 1, fp);
 	fwrite(std_dc_luminance_values, sizeof(std_dc_luminance_values), 1, fp);
@@ -291,47 +296,73 @@ bool jo_write_jpg(const char *filename, const void *data, int width, int height,
 	fwrite(head2, sizeof(head2), 1, fp);
 
 	// Encode 8x8 macroblocks
-	const unsigned char *imageData = (const unsigned char *)data;
+	int ofsG = comp > 1 ? 1 : 0, ofsB = comp > 1 ? 2 : 0;
+	const unsigned char *dataR = (const unsigned char *)data;
+	const unsigned char *dataG = dataR + ofsG;
+	const unsigned char *dataB = dataR + ofsB;
 	int DCY=0, DCU=0, DCV=0;
 	int bitBuf=0, bitCnt=0;
-	int ofsG = comp > 1 ? 1 : 0, ofsB = comp > 1 ? 2 : 0;
-	for(int y = 0; y < height; y += 8) {
-		for(int x = 0; x < width; x += 8) {
-			float YDU[64], UDU[64], VDU[64];
-			for(int row = y, pos = 0; row < y+8; ++row) {
-				for(int col = x; col < x+8; ++col, ++pos) {
-					int p = row*width*comp + col*comp;
-					if(row >= height) {
-						p -= width*comp*(row+1 - height);
+	if(subsample) {
+		for(int y = 0; y < height; y += 16) {
+			for(int x = 0; x < width; x += 16) {
+				float Y[256], U[256], V[256];
+				for(int row = y, pos = 0; row < y+16; ++row) {
+					for(int col = x; col < x+16; ++col, ++pos) {
+						int prow = row >= height ? height-1 : row;
+						int pcol = col >= width ? width-1 : col;
+						int p = prow*width*comp + pcol*comp;
+						float r = dataR[p], g = dataG[p], b = dataB[p];
+						Y[pos]=+0.29900f*r+0.58700f*g+0.11400f*b-128;
+						U[pos]=-0.16874f*r-0.33126f*g+0.50000f*b;
+						V[pos]=+0.50000f*r-0.41869f*g-0.08131f*b;
 					}
-					if(col >= width) {
-						p -= comp*(col+1 - width);
-					}
-
-					float r = imageData[p+0], g = imageData[p+ofsG], b = imageData[p+ofsB];
-					YDU[pos]=+0.29900f*r+0.58700f*g+0.11400f*b-128;
-					UDU[pos]=-0.16874f*r-0.33126f*g+0.50000f*b;
-					VDU[pos]=+0.50000f*r-0.41869f*g-0.08131f*b;
 				}
+				DCY = jo_processDU(fp, bitBuf, bitCnt, Y+0, 16, fdtbl_Y, DCY, YDC_HT, YAC_HT);
+				DCY = jo_processDU(fp, bitBuf, bitCnt, Y+8, 16, fdtbl_Y, DCY, YDC_HT, YAC_HT);
+				DCY = jo_processDU(fp, bitBuf, bitCnt, Y+128, 16, fdtbl_Y, DCY, YDC_HT, YAC_HT);
+				DCY = jo_processDU(fp, bitBuf, bitCnt, Y+136, 16, fdtbl_Y, DCY, YDC_HT, YAC_HT);
+				// subsample U,V
+				float subU[64], subV[64];
+				for(int yy = 0, pos = 0; yy < 8; ++yy) {
+					for(int xx = 0; xx < 8; ++xx, ++pos) {
+						int j = yy*32+xx*2;
+						subU[pos] = (U[j+0] + U[j+1] + U[j+16] + U[j+17]) * 0.25f;
+						subV[pos] = (V[j+0] + V[j+1] + V[j+16] + V[j+17]) * 0.25f;
+					}
+				}
+				DCU = jo_processDU(fp, bitBuf, bitCnt, subU, 8, fdtbl_UV, DCU, UVDC_HT, UVAC_HT);
+				DCV = jo_processDU(fp, bitBuf, bitCnt, subV, 8, fdtbl_UV, DCV, UVDC_HT, UVAC_HT);
 			}
-
-			DCY = jo_processDU(fp, bitBuf, bitCnt, YDU, fdtbl_Y, DCY, YDC_HT, YAC_HT);
-			DCU = jo_processDU(fp, bitBuf, bitCnt, UDU, fdtbl_UV, DCU, UVDC_HT, UVAC_HT);
-			DCV = jo_processDU(fp, bitBuf, bitCnt, VDU, fdtbl_UV, DCV, UVDC_HT, UVAC_HT);
+		}
+	} else {
+		for(int y = 0; y < height; y += 8) {
+			for(int x = 0; x < width; x += 8) {
+				float Y[64], U[64], V[64];
+				for(int row = y, pos = 0; row < y+8; ++row) {
+					for(int col = x; col < x+8; ++col, ++pos) {
+						int prow = row >= height ? height-1 : row;
+						int pcol = col >= width ? width-1 : col;
+						int p = prow*width*comp + pcol*comp;
+						float r = dataR[p], g = dataG[p], b = dataB[p];
+						Y[pos]=+0.29900f*r+0.58700f*g+0.11400f*b-128;
+						U[pos]=-0.16874f*r-0.33126f*g+0.50000f*b;
+						V[pos]=+0.50000f*r-0.41869f*g-0.08131f*b;
+					}
+				}
+				DCY = jo_processDU(fp, bitBuf, bitCnt, Y, 8, fdtbl_Y, DCY, YDC_HT, YAC_HT);
+				DCU = jo_processDU(fp, bitBuf, bitCnt, U, 8, fdtbl_UV, DCU, UVDC_HT, UVAC_HT);
+				DCV = jo_processDU(fp, bitBuf, bitCnt, V, 8, fdtbl_UV, DCV, UVDC_HT, UVAC_HT);
+			}
 		}
 	}
 	
 	// Do the bit alignment of the EOI marker
 	static const unsigned short fillBits[] = {0x7F, 7};
 	jo_writeBits(fp, bitBuf, bitCnt, fillBits);
-
-	// EOI
 	putc(0xFF, fp);
 	putc(0xD9, fp);
-
 	fclose(fp);
 	return true;
 }
 
 #endif
-
